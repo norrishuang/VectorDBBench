@@ -66,31 +66,34 @@ class AWSOpenSearch(VectorDB):
 
     def _create_index(self, client: OpenSearch) -> None:
         ef_search_value = self.case_config.ef_search
-        log.info(f"Creating index with ef_search: {ef_search_value}")
-        log.info(f"Creating index with number_of_replicas: {self.case_config.number_of_replicas}")
-
-        log.info(f"Creating index with engine: {self.case_config.engine}")
-        log.info(f"Creating index with metric type: {self.case_config.metric_type_name}")
         log.info(f"All case_config parameters: {self.case_config.__dict__}")
 
-        cluster_settings_body = {
-            "persistent": {
-                "knn.algo_param.index_thread_qty": self.case_config.index_thread_qty,
-                "knn.memory.circuit_breaker.limit": self.case_config.cb_threshold,
+        # Skip cluster settings for OpenSearch Serverless
+        is_serverless = ".aoss.amazonaws.com" in str(self.db_config.get("hosts", [{}])[0].get("host", ""))
+        if is_serverless:
+            log.info("Skipping cluster settings for OpenSearch Serverless")
+        else:
+            cluster_settings_body = {
+                "persistent": {
+                    "knn.algo_param.index_thread_qty": self.case_config.index_thread_qty,
+                    "knn.memory.circuit_breaker.limit": self.case_config.cb_threshold,
+                }
             }
-        }
-        client.cluster.put_settings(body=cluster_settings_body)
+            client.cluster.put_settings(body=cluster_settings_body)
         settings = {
             "index": {
                 "knn": True,
                 "number_of_shards": self.case_config.number_of_shards,
                 "number_of_replicas": self.case_config.number_of_replicas,
-                "translog.flush_threshold_size": self.case_config.flush_threshold_size,
-                "knn.advanced.approximate_threshold": "-1",
             },
-            "refresh_interval": self.case_config.refresh_interval,
         }
-        settings["index"]["knn.algo_param.ef_search"] = ef_search_value
+
+        # Add settings that are not supported in Serverless
+        if not is_serverless:
+            settings["refresh_interval"] = self.case_config.refresh_interval
+            settings["index"]["translog.flush_threshold_size"] = self.case_config.flush_threshold_size
+            settings["index"]["knn.advanced.approximate_threshold"] = "-1"
+            settings["index"]["knn.algo_param.ef_search"] = ef_search_value
 
         # Get method configuration and log it for debugging
         method_config = self.case_config.index_param()
@@ -206,25 +209,56 @@ class AWSOpenSearch(VectorDB):
         metadata: list[int],
         labels_data: list[str] | None = None,
     ) -> tuple[int, Exception]:
-        insert_data = []
-        for i in range(len(embeddings)):
-            index_data = {"index": {"_index": self.index_name, self.id_col_name: metadata[i]}}
-            if self.with_scalar_labels and self.case_config.use_routing and labels_data is not None:
-                index_data["routing"] = labels_data[i]
-            insert_data.append(index_data)
+        # Check if serverless and use smaller batches
+        is_serverless = ".aoss.amazonaws.com" in str(self.db_config.get("hosts", [{}])[0].get("host", ""))
+        batch_size = 100 if is_serverless else 1000
 
-            other_data = {self.vector_col_name: embeddings[i]}
-            if self.with_scalar_labels and labels_data is not None:
-                other_data[self.label_col_name] = labels_data[i]
-            insert_data.append(other_data)
+        embeddings_list = list(embeddings)
+        total_inserted = 0
 
-        try:
-            self.client.bulk(insert_data)
-            return len(embeddings), None
-        except Exception as e:
-            log.warning(f"Failed to insert data: {self.index_name} error: {e!s}")
-            time.sleep(10)
-            return self._insert_with_single_client(embeddings, metadata, labels_data)
+        for i in range(0, len(embeddings_list), batch_size):
+            batch_embeddings = embeddings_list[i : i + batch_size]
+            batch_metadata = metadata[i : i + batch_size]
+            batch_labels = labels_data[i : i + batch_size] if labels_data else None
+
+            insert_data = []
+            for j in range(len(batch_embeddings)):
+                if is_serverless:
+                    # For serverless, don't specify _id, let it auto-generate
+                    index_data = {"index": {"_index": self.index_name}}
+                else:
+                    # For regular OpenSearch, use custom _id
+                    index_data = {"index": {"_index": self.index_name, self.id_col_name: batch_metadata[j]}}
+
+                if self.with_scalar_labels and self.case_config.use_routing and batch_labels is not None:
+                    index_data["routing"] = batch_labels[j]
+                insert_data.append(index_data)
+
+                other_data = {self.vector_col_name: batch_embeddings[j]}
+
+                # For serverless, add id as a regular field
+                if is_serverless:
+                    other_data["id"] = batch_metadata[j]
+
+                if self.with_scalar_labels and batch_labels is not None:
+                    other_data[self.label_col_name] = batch_labels[j]
+                insert_data.append(other_data)
+
+            try:
+                self.client.bulk(insert_data)
+                total_inserted += len(batch_embeddings)
+            except Exception as e:
+                log.warning(f"Failed to insert batch: {self.index_name} error: {e!s}")
+                time.sleep(10)
+                # Retry this batch
+                try:
+                    self.client.bulk(insert_data)
+                    total_inserted += len(batch_embeddings)
+                except Exception as retry_e:
+                    logging.exception("Retry failed for batch")
+                    return total_inserted, retry_e
+
+        return total_inserted, None
 
     def _insert_with_multiple_clients(
         self,
@@ -381,24 +415,38 @@ class AWSOpenSearch(VectorDB):
         }
 
         try:
-            resp = self.client.search(
-                index=self.index_name,
-                body=body,
-                size=k,
-                _source=False,
-                docvalue_fields=[self.id_col_name],
-                stored_fields="_none_",
-                preference="_only_local" if self.case_config.number_of_shards == 1 else None,
-                routing=self.routing_key,
-            )
-            log.debug(f"Search took: {resp['took']}")
-            log.debug(f"Search shards: {resp['_shards']}")
-            log.debug(f"Search hits total: {resp['hits']['total']}")
-            try:
-                return [int(h["fields"][self.id_col_name][0]) for h in resp["hits"]["hits"]]
-            except Exception:
-                # empty results
-                return []
+            is_serverless = ".aoss.amazonaws.com" in str(self.db_config.get("hosts", [{}])[0].get("host", ""))
+
+            if is_serverless:
+                # For serverless, get the 'id' field from _source
+                resp = self.client.search(
+                    index=self.index_name,
+                    body=body,
+                    size=k,
+                    _source=["id"],
+                    preference="_only_local" if self.case_config.number_of_shards == 1 else None,
+                    routing=self.routing_key,
+                )
+                try:
+                    return [int(h["_source"]["id"]) for h in resp["hits"]["hits"]]
+                except Exception:
+                    return []
+            else:
+                # For regular OpenSearch, use docvalue_fields with _id
+                resp = self.client.search(
+                    index=self.index_name,
+                    body=body,
+                    size=k,
+                    _source=False,
+                    docvalue_fields=[self.id_col_name],
+                    stored_fields="_none_",
+                    preference="_only_local" if self.case_config.number_of_shards == 1 else None,
+                    routing=self.routing_key,
+                )
+                try:
+                    return [int(h["fields"][self.id_col_name][0]) for h in resp["hits"]["hits"]]
+                except Exception:
+                    return []
         except Exception as e:
             log.warning(f"Failed to search: {self.index_name} error: {e!s}")
             raise e from None
@@ -447,6 +495,12 @@ class AWSOpenSearch(VectorDB):
             log.warning(f"Failed to update ef_search parameter: {e}")
 
     def _update_replicas(self):
+        # Skip replica updates for OpenSearch Serverless
+        is_serverless = ".aoss.amazonaws.com" in str(self.db_config.get("hosts", [{}])[0].get("host", ""))
+        if is_serverless:
+            log.info("Skipping replica updates for OpenSearch Serverless")
+            return
+
         index_settings = self.client.indices.get_settings(index=self.index_name)
         current_number_of_replicas = int(index_settings[self.index_name]["settings"]["index"]["number_of_replicas"])
         log.info(
@@ -469,6 +523,13 @@ class AWSOpenSearch(VectorDB):
         log.info(f"Index {self.index_name} is green..")
 
     def _refresh_index(self):
+        # Skip manual refresh for OpenSearch Serverless
+        is_serverless = ".aoss.amazonaws.com" in str(self.db_config.get("hosts", [{}])[0].get("host", ""))
+        if is_serverless:
+            log.info("Skipping manual refresh for OpenSearch Serverless, waiting for auto-refresh...")
+            time.sleep(10)  # Wait for serverless auto-refresh
+            return
+
         log.debug(f"Starting refresh for index {self.index_name}")
         while True:
             try:
@@ -484,6 +545,12 @@ class AWSOpenSearch(VectorDB):
         log.debug(f"Completed refresh for index {self.index_name}")
 
     def _do_force_merge(self):
+        # Skip force merge operations for OpenSearch Serverless
+        is_serverless = ".aoss.amazonaws.com" in str(self.db_config.get("hosts", [{}])[0].get("host", ""))
+        if is_serverless:
+            log.info("Skipping force merge for OpenSearch Serverless")
+            return
+
         log.info(f"Updating the Index thread qty to {self.case_config.index_thread_qty_during_force_merge}.")
 
         cluster_settings_body = {
@@ -509,6 +576,12 @@ class AWSOpenSearch(VectorDB):
         log.info(f"Completed force merge for index {self.index_name}")
 
     def _load_graphs_to_memory(self, client: OpenSearch):
+        # Skip warmup for OpenSearch Serverless
+        is_serverless = ".aoss.amazonaws.com" in str(self.db_config.get("hosts", [{}])[0].get("host", ""))
+        if is_serverless:
+            log.info("Skipping warmup API for OpenSearch Serverless")
+            return
+
         if self.case_config.engine != AWSOS_Engine.lucene:
             log.info("Calling warmup API to load graphs into memory")
             warmup_endpoint = f"/_plugins/_knn/warmup/{self.index_name}"

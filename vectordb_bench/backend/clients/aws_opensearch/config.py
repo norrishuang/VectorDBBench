@@ -11,24 +11,99 @@ log = logging.getLogger(__name__)
 class AWSOpenSearchConfig(DBConfig, BaseModel):
     host: str = ""
     port: int = 80
-    user: str = ""
-    password: SecretStr = ""
+    user: str | None = ""
+    password: SecretStr | None = ""
+    is_serverless: bool = False
+    aws_region: str = "us-east-1"
 
     def to_dict(self) -> dict:
-        use_ssl = self.port == 443
-        http_auth = (
-            (self.user, self.password.get_secret_value()) if len(self.user) != 0 and len(self.password) != 0 else ()
-        )
-        return {
-            "hosts": [{"host": self.host, "port": self.port}],
-            "http_auth": http_auth,
-            "use_ssl": use_ssl,
-            "http_compress": True,
-            "verify_certs": use_ssl,
-            "ssl_assert_hostname": False,
-            "ssl_show_warn": False,
-            "timeout": 600,
-        }
+        if self.is_serverless:
+            # Serverless configuration with AWS SigV4
+            log.info("It's OpenSearch Serverless")
+            log.info(f"Host: {self.host}")
+            log.info(f"Region: {self.aws_region}")
+
+            try:
+                import boto3
+
+                session = boto3.Session()
+                credentials = session.get_credentials()
+
+                if not credentials:
+                    log.error("AWS credentials not found. Please configure AWS credentials.")
+                    raise ValueError("AWS credentials not found. Please configure AWS credentials.")
+
+                log.info(f"AWS credentials: {credentials.access_key[:8]}...")
+
+                # Use AWS4Auth
+                try:
+                    from opensearchpy import RequestsHttpConnection
+                    from requests_aws4auth import AWS4Auth
+
+                    auth = AWS4Auth(
+                        credentials.access_key,
+                        credentials.secret_key,
+                        self.aws_region,
+                        "aoss",
+                        session_token=credentials.token,
+                    )
+                    log.info("Use AWS4Auth")
+                except ImportError as e:
+                    raise ImportError(
+                        "requests-aws4auth is required for OpenSearch Serverless. "
+                        "Install with: pip install requests-aws4auth"
+                    ) from e
+
+                config = {
+                    "hosts": [{"host": self.host, "port": 443}],
+                    "http_auth": auth,
+                    "use_ssl": True,
+                    "verify_certs": True,
+                    "connection_class": RequestsHttpConnection,
+                    "timeout": 600,
+                    "max_retries": 3,
+                    "retry_on_timeout": True,
+                    "http_compress": True,
+                }
+
+                log.info("Serverless config completed (use AWS4Auth)")
+
+            except ImportError as e:
+                log.exception(
+                    "boto3 and opensearch-py[aws] are required for OpenSearch Serverless. "
+                    "Install with: pip install boto3 'opensearch-py[aws]'"
+                )
+                raise ImportError(
+                    "boto3 and opensearch-py[aws] are required for OpenSearch Serverless. "
+                    "Install with: pip install boto3 'opensearch-py[aws]'"
+                ) from e
+            else:
+                return config
+        else:
+            # Regular OpenSearch configuration
+            log.info("It's regular OpenSearch")
+            use_ssl = self.port == 443
+            http_auth = (
+                (self.user, self.password.get_secret_value())
+                if self.user and self.password and len(self.user) > 0 and len(self.password.get_secret_value()) > 0
+                else ()
+            )
+
+            if http_auth:
+                log.info(f"Host: {self.host}:{self.port}")
+            else:
+                log.info(f"Host: {self.host}:{self.port} (no auth)")
+
+            return {
+                "hosts": [{"host": self.host, "port": self.port}],
+                "http_auth": http_auth,
+                "use_ssl": use_ssl,
+                "http_compress": True,
+                "verify_certs": use_ssl,
+                "ssl_assert_hostname": False,
+                "ssl_show_warn": False,
+                "timeout": 600,
+            }
 
 
 class AWSOS_Engine(Enum):

@@ -20,8 +20,14 @@ log = logging.getLogger(__name__)
 class AWSOpenSearchTypedDict(TypedDict):
     host: Annotated[str, click.option("--host", type=str, help="Db host", required=True)]
     port: Annotated[int, click.option("--port", type=int, default=80, help="Db Port")]
-    user: Annotated[str, click.option("--user", type=str, help="Db User")]
-    password: Annotated[str, click.option("--password", type=str, help="Db password")]
+    user: Annotated[str, click.option("--user", type=str, default="", help="Db User (not needed for Serverless)")]
+    password: Annotated[
+        str, click.option("--password", type=str, default="", help="Db password (not needed for Serverless)")
+    ]
+    is_serverless: Annotated[bool, click.option("--serverless", is_flag=True, help="Use OpenSearch Serverless")]
+    aws_region: Annotated[
+        str, click.option("--aws-region", type=str, default="us-east-1", help="AWS region for Serverless")
+    ]
     number_of_shards: Annotated[
         int,
         click.option("--number-of-shards", type=int, help="Number of primary shards for the index", default=1),
@@ -139,13 +145,25 @@ class AWSOpenSearchTypedDict(TypedDict):
     ]
 
 
-class AWSOpenSearchHNSWTypedDict(CommonTypedDict, AWSOpenSearchTypedDict, HNSWFlavor1): ...
+class AWSOpenSearchHNSWTypedDict(CommonTypedDict, AWSOpenSearchTypedDict, HNSWFlavor1):
+    is_serverless: Annotated[bool, click.option("--serverless", is_flag=True, help="Use OpenSearch Serverless")]
 
 
 @cli.command()
 @click_parameter_decorators_from_typed_dict(AWSOpenSearchHNSWTypedDict)
 def AWSOpenSearch(**parameters: Unpack[AWSOpenSearchHNSWTypedDict]):
     from .config import AWSOpenSearchConfig, AWSOpenSearchIndexConfig
+
+    is_serverless = parameters.get("serverless", False)  # 键名是serverless不是is_serverless
+    log.info(f"Is Serverless: {is_serverless}")
+
+    if is_serverless:
+        log.info("Serverless model detected")
+        log.info("Sereerless mode will use AWS SigV4 for authentication")
+    else:
+        log.info("Server mode detected")
+        if not parameters.get("user") or not parameters.get("password"):
+            log.warning("Server mode requires user and password, but they are not provided.")
 
     # Set default values for HNSW parameters if not provided and not using s3vector
     engine = AWSOS_Engine(parameters["engine"])
@@ -162,13 +180,18 @@ def AWSOpenSearch(**parameters: Unpack[AWSOpenSearchHNSWTypedDict]):
         if m is None:
             m = 16
 
+    user = "admin" if is_serverless else parameters["user"]
+    password = "password" if is_serverless else parameters["password"]
+
     run(
         db=DB.AWSOpenSearch,
         db_config=AWSOpenSearchConfig(
             host=parameters["host"],
             port=parameters["port"],
-            user=parameters["user"],
-            password=SecretStr(parameters["password"]),
+            user=user,
+            password=SecretStr(password),
+            is_serverless=is_serverless,
+            aws_region=parameters.get("aws_region", "us-east-1"),
         ),
         db_case_config=AWSOpenSearchIndexConfig(
             number_of_shards=parameters["number_of_shards"],
