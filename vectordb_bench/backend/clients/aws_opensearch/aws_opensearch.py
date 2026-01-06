@@ -61,6 +61,7 @@ class AWSOpenSearch(VectorDB):
                 self._create_index(client)
                 log.info(f"AWS_OpenSearch client create index: {self.index_name}")
 
+            self._configure_cluster_settings(client)
             self._update_ef_search_before_search(client)
             self._load_graphs_to_memory(client)
 
@@ -95,7 +96,7 @@ class AWSOpenSearch(VectorDB):
                 "number_of_shards": self.case_config.number_of_shards,
                 "number_of_replicas": self.case_config.number_of_replicas,
                 "translog.flush_threshold_size": self.case_config.flush_threshold_size,
-                "knn.advanced.approximate_threshold": "-1",
+                "knn.advanced.approximate_threshold": "10000",
                 "knn.algo_param.ef_search": self.case_config.ef_search,
             },
             "refresh_interval": self.case_config.refresh_interval,
@@ -206,13 +207,13 @@ class AWSOpenSearch(VectorDB):
         """Insert the embeddings to the opensearch."""
         assert self.client is not None, "should self.init() first"
 
+        # 使用 number_of_indexing_clients 作为线程数
         num_clients = self.case_config.number_of_indexing_clients or 1
-        log.info(f"Number of indexing clients from case_config: {num_clients}")
-
         if num_clients <= 1:
             log.info("Using single client for data insertion")
             return self._insert_with_single_client(embeddings, metadata, labels_data)
-        log.info(f"Using {num_clients} parallel clients for data insertion")
+
+        log.info("Using %s parallel threads for data insertion", num_clients)
         return self._insert_with_multiple_clients(embeddings, metadata, num_clients, labels_data)
 
     def _insert_with_single_client(
@@ -248,30 +249,48 @@ class AWSOpenSearch(VectorDB):
         num_clients: int,
         labels_data: list[str] | None = None,
     ) -> tuple[int, Exception]:
+        """Use multiple threads to insert data in streaming fashion.
+        
+        Reads data in batches and submits each batch to a thread immediately.
+        If thread pool queue is full, waits for a thread to become available.
+        This reduces memory usage and starts writing earlier.
+        """
         import concurrent.futures
         from concurrent.futures import ThreadPoolExecutor
+        from threading import Lock, local
 
-        embeddings_list = list(embeddings)
-        chunk_size = max(1, len(embeddings_list) // num_clients)
-        chunks = []
+        # 获取批次大小配置
+        batch_size = getattr(self.case_config, "bulk_docs_per_chunk", 2000)
+        if batch_size <= 0:
+            batch_size = 2000
 
-        for i in range(0, len(embeddings_list), chunk_size):
-            end = min(i + chunk_size, len(embeddings_list))
-            chunk_labels = labels_data[i:end] if labels_data is not None else None
-            chunks.append((embeddings_list[i:end], metadata[i:end], chunk_labels))
+        num_clients = max(1, num_clients)
 
-        clients = []
-        for _ in range(min(num_clients, len(chunks))):
-            client = OpenSearch(**self.db_config)
-            clients.append(client)
+        log.info(
+            "Starting streaming multi-thread insert: num_threads=%s, batch_size=%s",
+            num_clients,
+            batch_size,
+        )
 
-        log.info(f"AWS_OpenSearch using {len(clients)} parallel clients for data insertion")
+        thread_state = local()
+        clients: list[OpenSearch] = []
+        clients_lock = Lock()
 
-        def insert_chunk(client_idx: int, chunk_idx: int):
-            chunk_embeddings, chunk_metadata, chunk_labels_data = chunks[chunk_idx]
-            client = clients[client_idx]
+        def _get_thread_local_client() -> OpenSearch:
+            client = getattr(thread_state, "client", None)
+            if client is None:
+                client = OpenSearch(**self.db_config)
+                thread_state.client = client
+                with clients_lock:
+                    clients.append(client)
+            return client
 
-            insert_data = []
+        def _build_bulk_payload(
+            chunk_embeddings: list[list[float]],
+            chunk_metadata: list[int],
+            chunk_labels_data: list[str] | None,
+        ) -> list[dict]:
+            insert_data: list[dict] = []
             for i in range(len(chunk_embeddings)):
                 index_data = {"index": {"_index": self.index_name, self.id_col_name: chunk_metadata[i]}}
                 if self.with_scalar_labels and self.case_config.use_routing and chunk_labels_data is not None:
@@ -282,27 +301,113 @@ class AWSOpenSearch(VectorDB):
                 if self.with_scalar_labels and chunk_labels_data is not None:
                     other_data[self.label_col_name] = chunk_labels_data[i]
                 insert_data.append(other_data)
+            return insert_data
+
+        def insert_chunk(
+            chunk_embeddings: list[list[float]],
+            chunk_metadata: list[int],
+            chunk_labels_data: list[str] | None,
+        ) -> tuple[int, Exception]:
+            client = _get_thread_local_client()
+            insert_data = _build_bulk_payload(chunk_embeddings, chunk_metadata, chunk_labels_data)
 
             try:
                 resp = client.bulk(body=insert_data)
-                log.info(f"Client {client_idx} added {len(resp['items'])} documents")
+                inserted_docs = len(resp.get("items", []))
+                log.debug("Thread inserted %s documents in one bulk", inserted_docs)
                 return len(chunk_embeddings), None
-            except Exception as e:
-                log.warning(f"Client {client_idx} failed to insert data: {e!s}")
-                return 0, e
+            except Exception as exc:
+                log.warning("Thread failed to insert data: %s", exc)
+                return 0, exc
 
-        results = []
-        with ThreadPoolExecutor(max_workers=len(clients)) as executor:
-            futures = []
+        results: list[tuple[int, Exception]] = []
+        active_futures: list[concurrent.futures.Future] = []  # 跟踪正在运行的任务
+        all_futures: list[concurrent.futures.Future] = []  # 跟踪所有已提交的任务
+        batch_idx = 0
+        current_batch_embeddings: list[list[float]] = []
+        current_batch_metadata: list[int] = []
+        current_batch_labels: list[str] | None = [] if labels_data is not None else None
+        current_idx = 0
 
-            for chunk_idx in range(len(chunks)):
-                client_idx = chunk_idx % len(clients)
-                futures.append(executor.submit(insert_chunk, client_idx, chunk_idx))
+        # 使用线程池，max_workers 控制并发线程数
+        with ThreadPoolExecutor(max_workers=num_clients) as executor:
+            # 主循环：持续读取数据并提交批次
+            for emb in embeddings:
+                current_batch_embeddings.append(emb)
+                current_batch_metadata.append(metadata[current_idx])
+                if labels_data is not None:
+                    current_batch_labels.append(labels_data[current_idx])
+                current_idx += 1
 
-            for future in concurrent.futures.as_completed(futures):
-                count, error = future.result()
-                results.append((count, error))
+                # 当批次达到指定大小时，提交给线程池
+                if len(current_batch_embeddings) >= batch_size:
+                    # 如果线程池满了（活跃任务数达到 max_workers），等待一个任务完成
+                    while len(active_futures) >= num_clients:
+                        # 等待至少一个任务完成
+                        done, not_done = concurrent.futures.wait(active_futures, return_when=concurrent.futures.FIRST_COMPLETED)
+                        # 收集已完成任务的结果
+                        for future in done:
+                            try:
+                                result = future.result()
+                                results.append(result)
+                                log.debug("Batch completed: %s documents", result[0])
+                            except Exception as exc:
+                                results.append((0, exc))
+                                log.warning("Batch failed: %s", exc)
+                            active_futures.remove(future)
+                    
+                    # 构建任务参数
+                    task_embeddings = current_batch_embeddings.copy()
+                    task_metadata = current_batch_metadata.copy()
+                    task_labels = current_batch_labels.copy() if current_batch_labels is not None else None
+                    
+                    # 提交任务（此时线程池肯定有空闲，不会阻塞）
+                    future = executor.submit(insert_chunk, task_embeddings, task_metadata, task_labels)
+                    active_futures.append(future)
+                    all_futures.append(future)
+                    batch_idx += 1
+                    
+                    log.debug("Submitted batch %s with %s documents (active threads: %s/%s)", 
+                             batch_idx, len(current_batch_embeddings), len(active_futures), num_clients)
+                    
+                    # 清空当前批次，继续读取下一批
+                    current_batch_embeddings.clear()
+                    current_batch_metadata.clear()
+                    if current_batch_labels is not None:
+                        current_batch_labels.clear()
 
+            # 提交最后一个不完整的批次（如果有）
+            if current_batch_embeddings:
+                # 如果线程池满了，等待一个任务完成
+                while len(active_futures) >= num_clients:
+                    done, not_done = concurrent.futures.wait(active_futures, return_when=concurrent.futures.FIRST_COMPLETED)
+                    for future in done:
+                        try:
+                            result = future.result()
+                            results.append(result)
+                            log.debug("Batch completed: %s documents", result[0])
+                        except Exception as exc:
+                            results.append((0, exc))
+                            log.warning("Batch failed: %s", exc)
+                        active_futures.remove(future)
+                
+                future = executor.submit(insert_chunk, current_batch_embeddings, current_batch_metadata, current_batch_labels)
+                active_futures.append(future)
+                all_futures.append(future)
+                log.debug("Submitted final batch %s with %s documents", batch_idx + 1, len(current_batch_embeddings))
+
+            # 读取完成，等待所有剩余任务完成
+            log.info("Reading complete. Waiting for %s remaining batches to finish", len(active_futures))
+            for future in concurrent.futures.as_completed(active_futures):
+                try:
+                    result = future.result()
+                    results.append(result)
+                    log.debug("Batch completed: %s documents", result[0])
+                except Exception as exc:
+                    results.append((0, exc))
+                    log.warning("Batch failed: %s", exc)
+
+        # 清理客户端连接
         from contextlib import suppress
 
         for client in clients:
@@ -310,20 +415,32 @@ class AWSOpenSearch(VectorDB):
                 client.close()
 
         total_count = sum(count for count, _ in results)
-        errors = [error for _, error in results if error is not None]
+        errors = [err for _, err in results if err is not None]
 
         if errors:
-            log.warning("Some clients failed to insert data, retrying with single client")
-            time.sleep(10)
-            return self._insert_with_single_client(embeddings, metadata)
+            log.warning(
+                "Multi-thread insert encountered %s error(s). "
+                "Successfully inserted %s documents. First error: %s",
+                len(errors),
+                total_count,
+                errors[0],
+            )
+            # 返回已成功插入的数量和第一个错误
+            return total_count, errors[0]
 
-        resp = self.client.indices.stats(index=self.index_name)
-        log.info(
-            f"""Total document count in index after parallel insertion:
-                {resp['_all']['primaries']['indexing']['index_total']}""",
-        )
+        # 使用主进程已有 client 查询统计信息
+        try:
+            resp = self.client.indices.stats(index=self.index_name)
+            total_indexed = resp["_all"]["primaries"]["indexing"]["index_total"]
+            log.info(
+                "Streaming multi-thread insertion complete. Total documents indexed in index stats: %s (this batch: %s)",
+                total_indexed,
+                total_count,
+            )
+        except Exception as exc:
+            log.warning("Failed to fetch index stats after multi-thread insert: %s", exc)
 
-        return (total_count, None)
+        return total_count, None
 
     def _update_ef_search_before_search(self, client: OpenSearch):
         ef_search_value = self.case_config.ef_search
@@ -505,11 +622,11 @@ class AWSOpenSearch(VectorDB):
         }
         self.client.cluster.put_settings(body=cluster_settings_body)
 
-        log.info("Updating the graph threshold to ensure that during merge we can do graph creation.")
-        output = self.client.indices.put_settings(
-            index=self.index_name, body={"index.knn.advanced.approximate_threshold": "0"}
-        )
-        log.info(f"response of updating setting is: {output}")
+        # log.info("Updating the graph threshold to ensure that during merge we can do graph creation.")
+        # output = self.client.indices.put_settings(
+        #     index=self.index_name, body={"index.knn.advanced.approximate_threshold": "0"}
+        # )
+        # log.info(f"response of updating setting is: {output}")
 
         log.info(f"Starting force merge for index {self.index_name}")
         segments = self.case_config.number_of_segments
